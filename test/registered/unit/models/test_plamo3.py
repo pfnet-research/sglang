@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.configs.plamo3 import Plamo3Config, is_full_attn
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.plamo3 import (
     Plamo3Decoder,
     Plamo3ForCausalLM,
@@ -163,13 +164,13 @@ class TestPlamo3Registry(CustomTestCase):
 
 
 class TestPlamo3RMSNorm(CustomTestCase):
-    def test_checkpoint_weight_is_loaded_as_offset(self):
+    def test_checkpoint_weight_is_preserved(self):
         norm = Plamo3RMSNorm(4, offset=0.2)
         loaded_weight = torch.tensor([0.1, -0.1, 0.0, 0.3])
 
-        norm.weight.weight_loader(norm.weight, loaded_weight)
+        default_weight_loader(norm.weight, loaded_weight)
 
-        torch.testing.assert_close(norm.weight, loaded_weight + 0.2)
+        torch.testing.assert_close(norm.state_dict()["weight"], loaded_weight)
 
     def test_forward_matches_reference(self):
         norm = Plamo3RMSNorm(
@@ -178,13 +179,13 @@ class TestPlamo3RMSNorm(CustomTestCase):
             offset=0.2,
         ).float()
         loaded_weight = torch.tensor([0.1, -0.1, 0.0, 0.3])
-        norm.weight.data.copy_(loaded_weight + 0.2)
+        norm.weight.data.copy_(loaded_weight)
         x = torch.tensor([[1.0, -2.0, 3.0, -4.0]])
 
         expected = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + 1e-6)
         expected *= loaded_weight + 0.2
 
-        torch.testing.assert_close(norm.forward_native(x), expected)
+        torch.testing.assert_close(norm(x), expected)
 
 
 class TestPlamo3Embedding(CustomTestCase):
