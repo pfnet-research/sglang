@@ -23,12 +23,14 @@ DEVICE = "cuda"
 DTYPES = [torch.float16, torch.bfloat16]
 
 
-def hf_rmsnorm_reference(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
+def hf_rmsnorm_reference(
+    x: torch.Tensor, w: torch.Tensor, eps: float, weight_offset: float = 0.0
+) -> torch.Tensor:
     """HF LlamaRMSNorm: normalize fp32, cast normalized x to dtype, then multiply weight."""
     x_fp32 = x.to(torch.float32)
     variance = x_fp32.pow(2).mean(-1, keepdim=True)
     x_normed = x_fp32 * torch.rsqrt(variance + eps)
-    return w * x_normed.to(x.dtype)
+    return (w + weight_offset).to(w.dtype) * x_normed.to(x.dtype)
 
 
 def sgl_rmsnorm_reference(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
@@ -81,6 +83,28 @@ def test_rmsnorm_hf_out_param(dtype: torch.dtype) -> None:
     torch.testing.assert_close(
         out, hf_rmsnorm_reference(x, w, EPS), atol=1e-2, rtol=1e-2
     )
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("hidden_size", [128, 5120])
+@pytest.mark.parametrize("weight_offset", [1.0, 0.2, 1.0 / (5**1.5)])
+def test_rmsnorm_hf_weight_offset(
+    dtype: torch.dtype, hidden_size: int, weight_offset: float
+) -> None:
+    torch.manual_seed(0)
+    x = torch.randn(8, hidden_size, device=DEVICE, dtype=dtype)
+    w = torch.randn(hidden_size, device=DEVICE, dtype=dtype)
+
+    out = rmsnorm_hf(x, w, EPS, weight_offset=weight_offset)
+    folded_out = rmsnorm_hf(x, (w + weight_offset).to(dtype), EPS)
+
+    torch.testing.assert_close(
+        out,
+        hf_rmsnorm_reference(x, w, EPS, weight_offset),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(out, folded_out, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("dtype", DTYPES)

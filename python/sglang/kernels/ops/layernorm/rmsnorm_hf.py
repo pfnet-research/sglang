@@ -51,8 +51,13 @@ def rmsnorm_hf(
     weight: torch.Tensor,
     eps: float = 1e-6,
     out: Optional[torch.Tensor] = None,
+    weight_offset: float = 0.0,
 ) -> torch.Tensor:
-    """RMSNorm: ``out = weight * cast_dtype(rsqrt(mean(x^2) + eps) * x)``.
+    """RMSNorm with cast-before-multiply semantics.
+
+    ``out = cast_dtype(weight + weight_offset) *
+    cast_dtype(rsqrt(mean(x^2) + eps) * x)``. The default offset keeps the
+    Hugging Face LlamaRMSNorm behavior.
 
     ``input`` must be 2D ``(num_tokens, hidden_size)``; callers with
     higher-rank tensors should reshape first. ``hidden_size`` must satisfy
@@ -75,5 +80,5 @@ def rmsnorm_hf(
     if input.numel() == 0:
         return out
     module = _jit_rmsnorm_hf_module(hidden_size, input.dtype)
-    module.rmsnorm_hf(input, weight, out, eps)
+    module.rmsnorm_hf(input, weight, out, eps, weight_offset)
     return out

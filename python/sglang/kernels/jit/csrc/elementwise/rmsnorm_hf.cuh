@@ -1,6 +1,7 @@
 /**
  * RMSNorm with HuggingFace semantics:
- *   out[i] = weight[i] * cast_dtype( rsqrt(mean_j(x[j]^2) + eps) * x[i] )
+ *   out[i] = cast_dtype(weight[i] + weight_offset) *
+ *            cast_dtype(rsqrt(mean_j(x[j]^2) + eps) * x[i])
  *
  * vs. standard rmsnorm: the normalized x is rounded to the activation dtype
  * BEFORE the weight multiply (not after). The multiply itself is done in fp32
@@ -32,6 +33,7 @@ struct RMSNormHFParams {
   int64_t output_stride;
   uint32_t num_tokens;
   float eps;
+  float weight_offset;
 };
 
 // ---------------------------------------------------------------------------
@@ -44,7 +46,7 @@ __global__ __launch_bounds__(32) void rmsnorm_hf_warp_kernel(const RMSNormHFPara
   using namespace device;
   constexpr int kElemsPerThread = kDim / kWarpThreads;
 
-  const auto& [input, weight_ptr, output, input_stride, output_stride, num_tokens, eps] = params;
+  const auto& [input, weight_ptr, output, input_stride, output_stride, num_tokens, eps, weight_offset] = params;
   const auto wr = static_cast<const Float*>(weight_ptr);
 
   PDLWaitPrimary<kUsePDL>();
@@ -69,7 +71,8 @@ __global__ __launch_bounds__(32) void rmsnorm_hf_warp_kernel(const RMSNormHFPara
     for (int k = 0; k < kElemsPerThread; ++k) {
       const int i = threadIdx.x + k * kWarpThreads;
       const Float xn = cast<Float>(xi_cache[k] * rstd);
-      yr[i] = cast<Float>(static_cast<float>(xn) * static_cast<float>(wr[i]));
+      const Float effective_weight = cast<Float>(static_cast<float>(wr[i]) + weight_offset);
+      yr[i] = cast<Float>(static_cast<float>(xn) * static_cast<float>(effective_weight));
     }
   }
 
@@ -84,7 +87,8 @@ __global__ __launch_bounds__(32) void rmsnorm_hf_warp_kernel(const RMSNormHFPara
 //         yields `rstd = rsqrt(mean(x^2) + eps)`.
 // Pass 2: reuse cached fp32 values — no second global read of `x`. Per-elem:
 //             xn = cast_to_dtype(x_fp32 * rstd)   <- HF's cast-before-mul
-//             y  = cast_to_dtype(float(xn) * float(w))
+//             we = cast_to_dtype(float(w) + weight_offset)
+//             y  = cast_to_dtype(float(xn) * float(we))
 // ---------------------------------------------------------------------------
 template <int64_t kDim, bool kUsePDL, typename Float>
 __global__ __launch_bounds__(512) void rmsnorm_hf_scalar_kernel(const RMSNormHFParams __grid_constant__ params) {
@@ -94,7 +98,7 @@ __global__ __launch_bounds__(512) void rmsnorm_hf_scalar_kernel(const RMSNormHFP
   // For kDim=4096: kElemsPerThread = 8 (32 bytes of fp32 cache per thread).
   constexpr int kElemsPerThread = (kDim + kNumThreads - 1) / kNumThreads;
 
-  const auto& [input, weight_ptr, output, input_stride, output_stride, num_tokens, eps] = params;
+  const auto& [input, weight_ptr, output, input_stride, output_stride, num_tokens, eps, weight_offset] = params;
   const auto xr = static_cast<const Float*>(pointer::offset<Float>(input, blockIdx.x * input_stride));
   const auto yr = static_cast<Float*>(pointer::offset<Float>(output, blockIdx.x * output_stride));
   const auto wr = static_cast<const Float*>(weight_ptr);
@@ -135,7 +139,8 @@ __global__ __launch_bounds__(512) void rmsnorm_hf_scalar_kernel(const RMSNormHFP
   for (int k = 0; k < kElemsPerThread; ++k) {
     const int i = threadIdx.x + k * kNumThreads;
     const Float xn = cast<Float>(xi_cache[k] * rstd);
-    yr[i] = cast<Float>(static_cast<float>(xn) * static_cast<float>(wr[i]));
+    const Float effective_weight = cast<Float>(static_cast<float>(wr[i]) + weight_offset);
+    yr[i] = cast<Float>(static_cast<float>(xn) * static_cast<float>(effective_weight));
   }
 
   PDLTriggerSecondary<kUsePDL>();
@@ -158,7 +163,8 @@ struct HFRMSNormWarpKernel {
   run(const tvm::ffi::TensorView input,
       const tvm::ffi::TensorView weight,
       const tvm::ffi::TensorView output,
-      float eps) {
+      float eps,
+      float weight_offset) {
     using namespace host;
     auto N = SymbolicSize{"num_tokens"};
     auto D = SymbolicSize{"hidden_size"};
@@ -183,6 +189,7 @@ struct HFRMSNormWarpKernel {
         .output_stride = SO.unwrap(),
         .num_tokens = num_tokens,
         .eps = eps,
+        .weight_offset = weight_offset,
     };
 
     static const uint32_t max_occupancy = runtime::get_blocks_per_sm(kernel, kBlockSize);
@@ -207,7 +214,8 @@ struct HFRMSNormKernel {
   run(const tvm::ffi::TensorView input,
       const tvm::ffi::TensorView weight,
       const tvm::ffi::TensorView output,
-      float eps) {
+      float eps,
+      float weight_offset) {
     using namespace host;
     auto N = SymbolicSize{"num_tokens"};
     auto D = SymbolicSize{"hidden_size"};
@@ -243,6 +251,7 @@ struct HFRMSNormKernel {
         .output_stride = SO.unwrap(),
         .num_tokens = num_tokens,
         .eps = eps,
+        .weight_offset = weight_offset,
     };
 
     LaunchKernel(num_tokens, kBlockSize, device_.unwrap())  //
