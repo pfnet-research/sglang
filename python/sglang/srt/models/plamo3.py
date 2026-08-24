@@ -5,6 +5,11 @@ from typing import Any, Iterable, Iterator, List, Optional, Set, Tuple, Union
 import torch
 from torch import nn
 
+from sglang.kernels.fused_op import BaseFusedOp
+from sglang.kernels.ops.layernorm.rmsnorm_hf import (
+    is_supported_rmsnorm_hf_hidden_size,
+    rmsnorm_hf,
+)
 from sglang.srt.configs.plamo3 import Plamo3Config
 from sglang.srt.distributed import (
     get_pp_group,
@@ -41,20 +46,37 @@ def get_attention_sliding_window_size(config: "Plamo3Config") -> int:
     return max(config.window_size - 1, 0)
 
 
-class Plamo3RMSNorm(nn.Module):
+class Plamo3RMSNorm(BaseFusedOp):
     def __init__(self, hidden_size: int, eps: float = 1e-6, offset: float = 1.0):
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
+        self.hidden_size = hidden_size
         self.offset = offset
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        in_dtype = x.dtype
-        x = x.to(torch.float32)
-        variance = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.variance_epsilon)
-        x = x.to(in_dtype)
-        return (self.offset + self.weight) * x
+    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
+        x_float = x.float()
+        x_normed = x_float * torch.rsqrt(
+            x_float.square().mean(-1, keepdim=True) + self.variance_epsilon
+        )
+        return x_normed.to(x.dtype) * (self.weight + self.offset)
+
+    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        if (
+            x.dtype not in (torch.float16, torch.bfloat16)
+            or self.weight.dtype != x.dtype
+            or not is_supported_rmsnorm_hf_hidden_size(self.hidden_size)
+        ):
+            return self.forward_native(x)
+
+        original_shape = x.shape
+        x = x.reshape(-1, self.hidden_size)
+        return rmsnorm_hf(
+            x,
+            self.weight,
+            self.variance_epsilon,
+            weight_offset=self.offset,
+        ).reshape(original_shape)
 
 
 class Plamo3MLP(nn.Module):
