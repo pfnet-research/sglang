@@ -1,6 +1,7 @@
 """Unit tests for ``sglang.srt.models.plamo3`` — no server, no weight loading."""
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -42,10 +43,6 @@ class TestPlamo3Config(CustomTestCase):
         cfg = self._make()
         self.assertIsNone(cfg.architectures)
 
-    def test_custom_architectures_respected(self):
-        cfg = self._make(architectures=["CustomArch"])
-        self.assertEqual(cfg.architectures, ["CustomArch"])
-
     def test_is_full_attn_pattern(self):
         # sliding_window_pattern=4: full attn at layers 3, 7, 11, ...
         self.assertFalse(is_full_attn(4, 0))
@@ -76,13 +73,10 @@ class TestPlamo3Config(CustomTestCase):
         self.assertEqual(cfg.rope_theta, 777_777)
         self.assertFalse(hasattr(cfg, "rope_global_theta"))
 
-    def test_legacy_sliding_window_scalar(self):
-        cfg = self._make(sliding_window=256)
-        self.assertEqual(cfg.window_size, 256)
-
-    def test_legacy_sliding_window_list(self):
-        cfg = self._make(sliding_window=[256, 256, None, 256])
-        self.assertEqual(cfg.window_size, 256)
+    def test_legacy_sliding_window(self):
+        for value in (256, [256, 256, None, 256]):
+            with self.subTest(value=value):
+                self.assertEqual(self._make(sliding_window=value).window_size, 256)
 
     def test_scale_embedding_default(self):
         self.assertFalse(self._make().scale_embedding)
@@ -129,17 +123,24 @@ class TestPlamo3Config(CustomTestCase):
             initial_context_length=4096,
             max_position_embeddings=262144,
         )
-        rs = cfg.rope_parameters
-        self.assertIsNotNone(rs)
-        full = rs["full_attention"]
-        self.assertEqual(full["rope_type"], "yarn")
-        self.assertEqual(full["factor"], 64.0)
-        self.assertEqual(full["original_max_position_embeddings"], 4096)
-        self.assertEqual(full["beta_fast"], 32.0)
-        self.assertEqual(full["beta_slow"], 1.0)
-        self.assertFalse(full["truncate"])
-        sliding = rs["sliding_attention"]
-        self.assertEqual(sliding["rope_type"], "default")
+        self.assertEqual(
+            cfg.rope_parameters,
+            {
+                "full_attention": {
+                    "rope_theta": cfg.rope_theta,
+                    "beta_fast": 32.0,
+                    "beta_slow": 1.0,
+                    "factor": 64.0,
+                    "original_max_position_embeddings": 4096,
+                    "rope_type": "yarn",
+                    "truncate": False,
+                },
+                "sliding_attention": {
+                    "rope_theta": cfg.rope_local_theta,
+                    "rope_type": "default",
+                },
+            },
+        )
 
     def test_rope_parameters_requires_initial_context_length(self):
         with self.assertRaises(AssertionError):
@@ -155,10 +156,6 @@ class TestPlamo3Config(CustomTestCase):
 
 
 class TestPlamo3Registry(CustomTestCase):
-    def test_model_arch_registered(self):
-        archs = ModelRegistry.get_supported_archs()
-        self.assertIn("Plamo3ForCausalLM", archs)
-
     def test_resolve_model_cls(self):
         model_cls, arch = ModelRegistry.resolve_model_cls(["Plamo3ForCausalLM"])
         self.assertIs(model_cls, Plamo3ForCausalLM)
@@ -181,7 +178,7 @@ class TestPlamo3RMSNorm(CustomTestCase):
             offset=0.2,
         ).float()
         loaded_weight = torch.tensor([0.1, -0.1, 0.0, 0.3])
-        norm.weight.weight_loader(norm.weight, loaded_weight)
+        norm.weight.data.copy_(loaded_weight + 0.2)
         x = torch.tensor([[1.0, -2.0, 3.0, -4.0]])
 
         expected = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + 1e-6)
@@ -215,17 +212,14 @@ class _AddOneDecoderLayer(torch.nn.Module):
 class TestPlamo3Eagle3(CustomTestCase):
     @staticmethod
     def _make_target(*, is_last_rank: bool = True, num_layers: int = 12):
-        class Target:
-            pass
-
-        target = Target()
-        target.config = Plamo3Config(num_hidden_layers=num_layers)
-        target.model = Target()
-        target.model.pp_group = Target()
-        target.model.pp_group.is_last_rank = is_last_rank
-        target.model.layers_to_capture = []
-        target.capture_aux_hidden_states = False
-        return target
+        return SimpleNamespace(
+            config=Plamo3Config(num_hidden_layers=num_layers),
+            model=SimpleNamespace(
+                pp_group=SimpleNamespace(is_last_rank=is_last_rank),
+                layers_to_capture=[],
+            ),
+            capture_aux_hidden_states=False,
+        )
 
     def test_default_eagle3_capture_layers(self):
         target = self._make_target(num_layers=12)

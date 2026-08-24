@@ -184,6 +184,7 @@ class Plamo3ToolDetector(BaseFormatDetector):
         self._streamed_raw_args = ""
         self._call_skipped = False
         self._tool_requests_started = False
+        self._tool_requests_finished = False
 
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
@@ -215,8 +216,7 @@ class Plamo3ToolDetector(BaseFormatDetector):
                 raw_args = _cut_at_first_marker(
                     _extract_argument_payload(match.group("args"))
                 ).strip()
-                # Conservative upstream policy: drop calls whose arguments are
-                # not valid JSON rather than forwarding malformed payloads.
+                # Drop calls whose arguments are not valid JSON.
                 try:
                     arguments = json.loads(raw_args)
                 except json.JSONDecodeError as e:
@@ -256,6 +256,9 @@ class Plamo3ToolDetector(BaseFormatDetector):
     ) -> StreamingParseResult:
         """Parse one streaming chunk into normal text and tool-call deltas."""
         self._buffer += new_text
+        if self._tool_requests_finished:
+            return StreamingParseResult(normal_text=self._emit_normal_suffix())
+
         normal_parts: List[str] = []
         calls: List[ToolCallItem] = []
 
@@ -284,14 +287,18 @@ class Plamo3ToolDetector(BaseFormatDetector):
         try:
             while True:
                 buffer = self._buffer
-                full_match = _CALL_RE.search(buffer)
+                outer_end = buffer.find(END_TOOL_REQUESTS)
+                search_end = outer_end if outer_end != -1 else len(buffer)
+                full_match = _CALL_RE.search(buffer, 0, search_end)
                 partial_match = (
-                    None if full_match is not None else _STREAM_CALL_RE.search(buffer)
+                    None
+                    if full_match is not None
+                    else _STREAM_CALL_RE.search(buffer, 0, search_end)
                 )
                 name_match = (
                     None
                     if (full_match or partial_match)
-                    else _STREAM_NAME_RE.search(buffer)
+                    else _STREAM_NAME_RE.search(buffer, 0, search_end)
                 )
                 call_match = full_match or partial_match or name_match
 
@@ -324,6 +331,15 @@ class Plamo3ToolDetector(BaseFormatDetector):
                     self._buffer = buffer[full_match.end() :]
                     self._finish_call()
                     continue
+
+                if outer_end != -1:
+                    if self.current_tool_name_sent or self._call_skipped:
+                        self._abandon_call()
+                    normal_parts.append(_strip_markers(buffer[:outer_end]))
+                    self._buffer = buffer[outer_end + len(END_TOOL_REQUESTS) :]
+                    self._tool_requests_finished = True
+                    normal_parts.append(self._emit_normal_suffix())
+                    break
 
                 if partial_match is not None:
                     args_block = partial_match.group("args")
@@ -371,6 +387,14 @@ class Plamo3ToolDetector(BaseFormatDetector):
                 normal_text="".join(normal_parts),
                 calls=calls,
             )
+
+    def _emit_normal_suffix(self) -> str:
+        """Emit text after the one allowed outer tool-request wrapper."""
+        held_marker_length = self._partial_marker_hold(self._buffer)
+        emit_length = len(self._buffer) - held_marker_length
+        normal_text = _strip_markers(self._buffer[:emit_length])
+        self._buffer = self._buffer[emit_length:]
+        return normal_text
 
     def _stream_call(
         self, name: str, args_text: str, *, final: bool
@@ -467,6 +491,10 @@ class Plamo3ToolDetector(BaseFormatDetector):
         detectors by dropping that protocol fragment instead of exposing it as
         normal text or fabricating a completed call.
         """
+        if self._tool_requests_finished:
+            self._buffer = ""
+            return StreamingParseResult()
+
         if self._tool_requests_started:
             if self.current_tool_name_sent:
                 self._abandon_call()

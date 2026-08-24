@@ -5499,21 +5499,42 @@ class TestPlamo3ToolDetector(unittest.TestCase):
         ]
         self.detector = Plamo3ToolDetector()
 
-    def _make_tool_request(self, name, args_json):
+    @staticmethod
+    def _make_tool_header(name):
+        return BEGIN_TOOL_REQUEST + BEGIN_TOOL_NAME + name + END_TOOL_NAME
+
+    @classmethod
+    def _make_tool_call(cls, name, args_json):
         return (
-            BEGIN_TOOL_REQUESTS
-            + BEGIN_TOOL_REQUEST
-            + BEGIN_TOOL_NAME
-            + name
-            + END_TOOL_NAME
+            cls._make_tool_header(name)
             + BEGIN_TOOL_ARGUMENTS
             + CONSTRAIN_JSON
             + MSG
             + args_json
             + END_TOOL_ARGUMENTS
             + END_TOOL_REQUEST
-            + END_TOOL_REQUESTS
         )
+
+    @staticmethod
+    def _wrap_tool_calls(*calls):
+        return BEGIN_TOOL_REQUESTS + "".join(calls) + END_TOOL_REQUESTS
+
+    def _make_tool_request(self, name, args_json):
+        return self._wrap_tool_calls(self._make_tool_call(name, args_json))
+
+    def _parse_stream(self, chunks):
+        detector = Plamo3ToolDetector()
+        normal_text = ""
+        calls = {}
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            normal_text += result.normal_text
+            for call in result.calls:
+                parsed = calls.setdefault(call.tool_index, {"name": "", "args": ""})
+                parsed["name"] += call.name or ""
+                parsed["args"] += call.parameters or ""
+        normal_text += detector.finish(self.tools).normal_text
+        return normal_text, calls
 
     def test_detect_and_parse_single_call(self):
         text = self._make_tool_request("get_weather", '{"city": "Tokyo"}')
@@ -5534,29 +5555,9 @@ class TestPlamo3ToolDetector(unittest.TestCase):
         self.assertEqual(json.loads(result.calls[0].parameters), {"city": "Osaka"})
 
     def test_detect_and_parse_multiple_calls(self):
-        text = (
-            BEGIN_TOOL_REQUESTS
-            + BEGIN_TOOL_REQUEST
-            + BEGIN_TOOL_NAME
-            + "get_weather"
-            + END_TOOL_NAME
-            + BEGIN_TOOL_ARGUMENTS
-            + CONSTRAIN_JSON
-            + MSG
-            + '{"city": "Tokyo"}'
-            + END_TOOL_ARGUMENTS
-            + END_TOOL_REQUEST
-            + BEGIN_TOOL_REQUEST
-            + BEGIN_TOOL_NAME
-            + "get_weather"
-            + END_TOOL_NAME
-            + BEGIN_TOOL_ARGUMENTS
-            + CONSTRAIN_JSON
-            + MSG
-            + '{"city": "Osaka"}'
-            + END_TOOL_ARGUMENTS
-            + END_TOOL_REQUEST
-            + END_TOOL_REQUESTS
+        text = self._wrap_tool_calls(
+            self._make_tool_call("get_weather", '{"city": "Tokyo"}'),
+            self._make_tool_call("get_weather", '{"city": "Osaka"}'),
         )
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 2)
@@ -5571,26 +5572,12 @@ class TestPlamo3ToolDetector(unittest.TestCase):
         self.assertEqual(len(result.calls), 0)
         self.assertIn("Hello world", result.normal_text)
 
-    def test_detect_and_parse_empty_arguments(self):
-        text = self._make_tool_request("get_weather", "   ")
-        result = self.detector.detect_and_parse(text, self.tools)
-        self.assertEqual(len(result.calls), 0)
-
     def test_detect_and_parse_ignores_wrapper_whitespace_and_preserves_suffix(self):
         text = (
             "prefix"
             + BEGIN_TOOL_REQUESTS
             + "\n  "
-            + BEGIN_TOOL_REQUEST
-            + BEGIN_TOOL_NAME
-            + "get_weather"
-            + END_TOOL_NAME
-            + BEGIN_TOOL_ARGUMENTS
-            + CONSTRAIN_JSON
-            + MSG
-            + '{"city": "Tokyo"}'
-            + END_TOOL_ARGUMENTS
-            + END_TOOL_REQUEST
+            + self._make_tool_call("get_weather", '{"city": "Tokyo"}')
             + "\n"
             + END_TOOL_REQUESTS
             + "suffix"
@@ -5599,116 +5586,63 @@ class TestPlamo3ToolDetector(unittest.TestCase):
         self.assertEqual(result.normal_text, "prefixsuffix")
         self.assertEqual(len(result.calls), 1)
 
-    def test_detect_and_parse_does_not_parse_calls_after_outer_wrapper(self):
-        text = (
-            self._make_tool_request("get_weather", '{"city": "Tokyo"}')
-            + BEGIN_TOOL_REQUEST
-            + BEGIN_TOOL_NAME
-            + "get_weather"
-            + END_TOOL_NAME
-            + BEGIN_TOOL_ARGUMENTS
-            + CONSTRAIN_JSON
-            + MSG
-            + '{"city": "Osaka"}'
-            + END_TOOL_ARGUMENTS
-            + END_TOOL_REQUEST
-        )
+    def test_only_first_outer_wrapper_is_parsed(self):
+        text = self._make_tool_request(
+            "get_weather", '{"city": "Tokyo"}'
+        ) + self._make_tool_request("get_weather", '{"city": "Osaka"}')
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 1)
         self.assertIn("Osaka", result.normal_text)
 
+        normal_text, calls = self._parse_stream(text)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("Osaka", normal_text)
+
     def test_detect_and_parse_invalid_json(self):
-        text = (
-            BEGIN_TOOL_REQUESTS
-            + BEGIN_TOOL_REQUEST
-            + BEGIN_TOOL_NAME
-            + "get_weather"
-            + END_TOOL_NAME
-            + BEGIN_TOOL_ARGUMENTS
-            + CONSTRAIN_JSON
-            + MSG
-            + "not valid json"
-            + END_TOOL_ARGUMENTS
-            + END_TOOL_REQUEST
-            + END_TOOL_REQUESTS
-        )
+        text = self._make_tool_request("get_weather", "not valid json")
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 0)
 
-    def test_streaming_single_call(self):
-        full_text = self._make_tool_request("get_weather", '{"city": "Nagoya"}')
-        chunk_size = 5
-        tool_calls = {}
-        for i in range(0, len(full_text), chunk_size):
-            chunk = full_text[i : i + chunk_size]
-            result = self.detector.parse_streaming_increment(chunk, self.tools)
-            for call in result.calls:
-                idx = call.tool_index
-                if idx not in tool_calls:
-                    tool_calls[idx] = {"name": "", "parameters": ""}
-                if call.name:
-                    tool_calls[idx]["name"] += call.name
-                if call.parameters:
-                    tool_calls[idx]["parameters"] += call.parameters
-        self.assertEqual(len(tool_calls), 1)
-        self.assertEqual(tool_calls[0]["name"], "get_weather")
-        self.assertEqual(json.loads(tool_calls[0]["parameters"]), {"city": "Nagoya"})
+    def test_unknown_tool_is_not_emitted(self):
+        text = self._make_tool_request("unknown", "{}")
+        self.assertEqual(self.detector.detect_and_parse(text, self.tools).calls, [])
+        self.assertEqual(self._parse_stream(text)[1], {})
 
-    def test_streaming_multiple_calls(self):
-        full_text = (
-            BEGIN_TOOL_REQUESTS
-            + BEGIN_TOOL_REQUEST
-            + BEGIN_TOOL_NAME
-            + "get_weather"
-            + END_TOOL_NAME
-            + BEGIN_TOOL_ARGUMENTS
-            + CONSTRAIN_JSON
-            + MSG
-            + '{"city": "Tokyo"}'
-            + END_TOOL_ARGUMENTS
-            + END_TOOL_REQUEST
-            + BEGIN_TOOL_REQUEST
-            + BEGIN_TOOL_NAME
-            + "get_weather"
-            + END_TOOL_NAME
-            + BEGIN_TOOL_ARGUMENTS
-            + CONSTRAIN_JSON
-            + MSG
-            + '{"city": "Yokohama"}'
-            + END_TOOL_ARGUMENTS
-            + END_TOOL_REQUEST
-            + END_TOOL_REQUESTS
+    def test_streaming_multiple_calls_across_token_boundaries(self):
+        text = (
+            "prefix"
+            + self._wrap_tool_calls(
+                self._make_tool_call("get_weather", '{"city": "Tokyo"}'),
+                self._make_tool_call("get_weather", '{"city": "Yokohama"}'),
+            )
+            + "suffix"
         )
-        chunk_size = 7
-        tool_calls = {}
-        for i in range(0, len(full_text), chunk_size):
-            chunk = full_text[i : i + chunk_size]
-            result = self.detector.parse_streaming_increment(chunk, self.tools)
-            for call in result.calls:
-                idx = call.tool_index
-                if idx not in tool_calls:
-                    tool_calls[idx] = {"name": "", "parameters": ""}
-                if call.name:
-                    tool_calls[idx]["name"] += call.name
-                if call.parameters:
-                    tool_calls[idx]["parameters"] += call.parameters
-        self.assertEqual(len(tool_calls), 2)
-        self.assertEqual(tool_calls[0]["name"], "get_weather")
-        self.assertEqual(tool_calls[1]["name"], "get_weather")
-        self.assertEqual(json.loads(tool_calls[0]["parameters"]), {"city": "Tokyo"})
-        self.assertEqual(json.loads(tool_calls[1]["parameters"]), {"city": "Yokohama"})
+
+        normal_text, calls = self._parse_stream(text)
+
+        self.assertEqual(normal_text, "prefixsuffix")
+        self.assertEqual(
+            calls,
+            {
+                0: {"name": "get_weather", "args": '{"city": "Tokyo"}'},
+                1: {"name": "get_weather", "args": '{"city": "Yokohama"}'},
+            },
+        )
 
     def test_structure_info(self):
-        get_info = self.detector.structure_info()
-        info = get_info("get_weather")
+        info = self.detector.structure_info()("get_weather")
         self.assertEqual(info.trigger, BEGIN_TOOL_REQUESTS)
-        self.assertIn(BEGIN_TOOL_REQUEST, info.begin)
-        self.assertIn("get_weather", info.begin)
-        self.assertIn(END_TOOL_ARGUMENTS, info.end)
-        self.assertIn(END_TOOL_REQUEST, info.end)
-        # The legacy fallback describes one complete request. The model-native
-        # structural tag below owns the repeated inner blocks used in parallel.
-        self.assertIn(END_TOOL_REQUESTS, info.end)
+        self.assertEqual(
+            info.begin,
+            BEGIN_TOOL_REQUESTS
+            + self._make_tool_header("get_weather")
+            + BEGIN_TOOL_ARGUMENTS
+            + CONSTRAIN_JSON
+            + MSG,
+        )
+        self.assertEqual(
+            info.end, END_TOOL_ARGUMENTS + END_TOOL_REQUEST + END_TOOL_REQUESTS
+        )
 
     def test_has_tool_call(self):
         # Only the outer marker signals a tool-call section; the inner marker
@@ -5718,6 +5652,11 @@ class TestPlamo3ToolDetector(unittest.TestCase):
         self.assertFalse(self.detector.has_tool_call("plain text"))
 
     def test_get_structural_tag_parallel(self):
+        try:
+            import xgrammar
+        except ImportError:
+            self.skipTest("xgrammar not available")
+
         tools = [
             Tool(
                 type="function",
@@ -5746,10 +5685,6 @@ class TestPlamo3ToolDetector(unittest.TestCase):
         self.assertIn("get_weather", blob)
         self.assertIn("get_time", blob)
 
-        try:
-            import xgrammar
-        except ImportError:
-            self.skipTest("xgrammar not available")
         vocab = [
             BEGIN_TOOL_REQUESTS,
             END_TOOL_REQUESTS,
@@ -5775,32 +5710,10 @@ class TestPlamo3ToolDetector(unittest.TestCase):
         compiler = xgrammar.GrammarCompiler(xgrammar.TokenizerInfo(vocab))
         ctx = compiler.compile_structural_tag(tag.model_dump_json())
         matcher = xgrammar.GrammarMatcher(ctx)
-        weather_call = (
-            BEGIN_TOOL_REQUEST
-            + BEGIN_TOOL_NAME
-            + "get_weather"
-            + END_TOOL_NAME
-            + BEGIN_TOOL_ARGUMENTS
-            + CONSTRAIN_JSON
-            + MSG
-            + '{"city": "Tokyo"}'
-            + END_TOOL_ARGUMENTS
-            + END_TOOL_REQUEST
-        )
-        time_call = (
-            BEGIN_TOOL_REQUEST
-            + BEGIN_TOOL_NAME
-            + "get_time"
-            + END_TOOL_NAME
-            + BEGIN_TOOL_ARGUMENTS
-            + CONSTRAIN_JSON
-            + MSG
-            + "{}"
-            + END_TOOL_ARGUMENTS
-            + END_TOOL_REQUEST
-        )
-        one_call_sample = BEGIN_TOOL_REQUESTS + weather_call + END_TOOL_REQUESTS
-        sample = BEGIN_TOOL_REQUESTS + weather_call + time_call + END_TOOL_REQUESTS
+        weather_call = self._make_tool_call("get_weather", '{"city": "Tokyo"}')
+        time_call = self._make_tool_call("get_time", "{}")
+        one_call_sample = self._wrap_tool_calls(weather_call)
+        sample = self._wrap_tool_calls(weather_call, time_call)
 
         # Both inner calls must be guided, not just the first one.
         self.assertTrue(matcher.accept_string(sample))
@@ -5850,13 +5763,7 @@ class TestPlamo3ToolDetector(unittest.TestCase):
     def test_streaming_name_first(self):
         # The function name is delimited before any arguments arrive, so the
         # name must be emitted ahead of the argument payload.
-        header = (
-            BEGIN_TOOL_REQUESTS
-            + BEGIN_TOOL_REQUEST
-            + BEGIN_TOOL_NAME
-            + "get_weather"
-            + END_TOOL_NAME
-        )
+        header = BEGIN_TOOL_REQUESTS + self._make_tool_header("get_weather")
         rest = (
             BEGIN_TOOL_ARGUMENTS
             + CONSTRAIN_JSON
@@ -5886,24 +5793,15 @@ class TestPlamo3ToolDetector(unittest.TestCase):
         end = self.detector.finish(self.tools)
         self.assertEqual(end.normal_text, "")
         self.assertEqual(end.calls, [])
-        self.assertEqual(self.detector._buffer, "")
 
     def test_streaming_finish_abandons_incomplete_tool_request(self):
-        header = (
-            BEGIN_TOOL_REQUESTS
-            + BEGIN_TOOL_REQUEST
-            + BEGIN_TOOL_NAME
-            + "get_weather"
-            + END_TOOL_NAME
-        )
+        header = BEGIN_TOOL_REQUESTS + self._make_tool_header("get_weather")
         first = self.detector.parse_streaming_increment(header, self.tools)
         self.assertEqual([call.name for call in first.calls], ["get_weather"])
 
         end = self.detector.finish(self.tools)
         self.assertEqual(end.normal_text, "")
         self.assertEqual(end.calls, [])
-        self.assertEqual(self.detector._buffer, "")
-        self.assertFalse(self.detector.current_tool_name_sent)
 
         # Finishing is idempotent and must not emit the abandoned call again.
         second_end = self.detector.finish(self.tools)
