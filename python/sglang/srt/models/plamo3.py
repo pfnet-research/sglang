@@ -453,8 +453,8 @@ class Plamo3ForCausalLM(nn.Module):
     }
 
     packed_modules_mapping = {
-        "qkv_proj": ["qkv_proj"],
-        "gate_up_proj": ["gate_up_proj"],
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
     }
     supported_lora_modules = ["qkv_proj", "o_proj", "gate_up_proj", "down_proj"]
     embedding_modules: dict[str, Any] = {}
