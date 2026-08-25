@@ -162,11 +162,12 @@ class TestPlamo3Registry(CustomTestCase):
         self.assertIs(model_cls, Plamo3ForCausalLM)
         self.assertEqual(arch, "Plamo3ForCausalLM")
 
-    def test_packed_modules_mapping_uses_split_checkpoint_names(self):
+    def test_packed_modules_mapping_preserves_fused_checkpoint_names(self):
         self.assertEqual(
             Plamo3ForCausalLM.packed_modules_mapping,
             {
-                "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+                "qkv_proj": ["qkv_proj"],
+                "gate_up_proj": ["gate_up_proj"],
             },
         )
 

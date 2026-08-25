@@ -415,45 +415,26 @@ class Plamo3ForCausalLM(nn.Module):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
-    # BitandBytes specific attributes
+    # BitsAndBytes-specific attributes for PLaMo's checkpoint-native fused
+    # projections.
     default_bitsandbytes_target_modules = [
         ".gate_up_proj.",
-        ".gate_proj.",
         ".down_proj.",
-        ".up_proj.",
         ".qkv_proj.",
-        ".q_proj.",
-        ".k_proj.",
-        ".v_proj.",
         ".o_proj.",
     ]
     # In TP, row-parallel weights are partitioned along the input dimension.
     column_parallel_weights_modules = [".down_proj.", ".o_proj."]
     bitsandbytes_stacked_params_mapping = {
         # shard_name, weight_name, index
-        # On-the-fly BNB loading names packed parameters ``qweight`` while the
-        # BNB linear layer exposes them as ``weight``. Keep native fused names
-        # before split suffixes: ``qkv_proj`` ends in ``v_proj``, and
-        # ``gate_up_proj`` ends in ``up_proj``.
-        "qkv_proj.qweight": ("qkv_proj.weight", 0),
-        "gate_up_proj.qweight": ("gate_up_proj.weight", 0),
-        "qkv_proj.weight": ("qkv_proj.weight", 0),
-        "gate_up_proj.weight": ("gate_up_proj.weight", 0),
-        "q_proj.qweight": ("qkv_proj.weight", 0),
-        "k_proj.qweight": ("qkv_proj.weight", 1),
-        "v_proj.qweight": ("qkv_proj.weight", 2),
-        "gate_proj.qweight": ("gate_up_proj.weight", 0),
-        "up_proj.qweight": ("gate_up_proj.weight", 1),
-        "q_proj": ("qkv_proj", 0),
-        "k_proj": ("qkv_proj", 1),
-        "v_proj": ("qkv_proj", 2),
-        "gate_proj": ("gate_up_proj", 0),
-        "up_proj": ("gate_up_proj", 1),
+        # The on-the-fly loader emits ``*.qweight`` names, while the
+        # BitsAndBytes linear layer exposes the parameter as ``*.weight``.
         "qweight": ("weight", 0),
     }
 
     packed_modules_mapping = {
-        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "qkv_proj": ["qkv_proj"],
+        "gate_up_proj": ["gate_up_proj"],
     }
     supported_lora_modules = ["qkv_proj", "o_proj", "gate_up_proj", "down_proj"]
     embedding_modules: dict[str, Any] = {}
@@ -642,10 +623,6 @@ class Plamo3ForCausalLM(nn.Module):
                 mapped_name = ".".join(
                     param_name if part == shard_name else part for part in parts
                 )
-                if mapped_name not in params_dict and mapped_name.endswith(".qweight"):
-                    bnb_name = mapped_name.removesuffix(".qweight") + ".weight"
-                    if bnb_name in params_dict:
-                        mapped_name = bnb_name
                 if mapped_name.endswith(".bias") and mapped_name not in params_dict:
                     continue
                 param = params_dict[mapped_name]
