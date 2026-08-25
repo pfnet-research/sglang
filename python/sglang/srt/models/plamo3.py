@@ -454,7 +454,6 @@ class Plamo3ForCausalLM(nn.Module):
 
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-        "gate_up_proj": ["gate_proj", "up_proj"],
     }
     supported_lora_modules = ["qkv_proj", "o_proj", "gate_up_proj", "down_proj"]
     embedding_modules: dict[str, Any] = {}
@@ -643,8 +642,10 @@ class Plamo3ForCausalLM(nn.Module):
                 mapped_name = ".".join(
                     param_name if part == shard_name else part for part in parts
                 )
-                if mapped_name.endswith(".qweight"):
-                    mapped_name = mapped_name.removesuffix(".qweight") + ".weight"
+                if mapped_name not in params_dict and mapped_name.endswith(".qweight"):
+                    bnb_name = mapped_name.removesuffix(".qweight") + ".weight"
+                    if bnb_name in params_dict:
+                        mapped_name = bnb_name
                 if mapped_name.endswith(".bias") and mapped_name not in params_dict:
                     continue
                 param = params_dict[mapped_name]
@@ -660,8 +661,10 @@ class Plamo3ForCausalLM(nn.Module):
                 # at runtime by get_rope.
                 if "rotary_emb" in name:
                     continue
-                if name.endswith(".qweight"):
-                    name = name.removesuffix(".qweight") + ".weight"
+                if name not in params_dict and name.endswith(".qweight"):
+                    bnb_name = name.removesuffix(".qweight") + ".weight"
+                    if bnb_name in params_dict:
+                        name = bnb_name
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 name = maybe_remap_kv_scale_name(name, params_dict)

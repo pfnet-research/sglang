@@ -18,9 +18,9 @@ choices = ["A", "B", "C", "D"]
 
 
 def format_subject(subject):
-    parts = subject.split("_")
+    l = subject.split("_")
     s = ""
-    for entry in parts:
+    for entry in l:
         s += " " + entry
     return s
 
@@ -50,14 +50,9 @@ def gen_prompt(train_df, subject, k=-1):
 @torch.no_grad()
 def main(args):
     print(f"Loading model: {args.model_path}")
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model_path,
-        revision=args.revision,
-        trust_remote_code=True,
-    )
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
-        revision=args.revision,
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
         device_map="auto",
@@ -140,7 +135,6 @@ def main(args):
                 "other": {
                     "nsub": args.nsub,
                     "ntrain": args.ntrain,
-                    "revision": args.revision,
                 },
             }
             fout.write(json.dumps(value) + "\n")
@@ -149,7 +143,6 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", type=str, required=True)
-    parser.add_argument("--revision", type=str)
     parser.add_argument("--ntrain", type=int, default=5)
     parser.add_argument("--data-dir", type=str, default="data")
     parser.add_argument("--nsub", type=int, default=60)
