@@ -5784,15 +5784,23 @@ class TestPlamo3ToolDetector(unittest.TestCase):
             params += call.parameters or ""
         self.assertEqual(json.loads(params), {"city": "Kyoto"})
 
-    def test_streaming_finish_drops_partial_outer_marker(self):
+    def test_streaming_finish_flushes_partial_outer_marker(self):
         result = self.detector.parse_streaming_increment(
             "visible text" + BEGIN_TOOL_REQUESTS[:-3], self.tools
         )
         self.assertEqual(result.normal_text, "visible text")
 
         end = self.detector.finish(self.tools)
-        self.assertEqual(end.normal_text, "")
+        self.assertEqual(end.normal_text, BEGIN_TOOL_REQUESTS[:-3])
         self.assertEqual(end.calls, [])
+
+    def test_streaming_finish_flushes_partial_marker_after_tool_wrapper(self):
+        text = self._make_tool_request("get_weather", '{"city": "Tokyo"}')
+        normal_text, calls = self._parse_stream(text + "suffix <")
+
+        self.assertEqual(normal_text, "suffix <")
+        self.assertEqual(calls[0]["name"], "get_weather")
+        self.assertEqual(json.loads(calls[0]["args"]), {"city": "Tokyo"})
 
     def test_streaming_finish_abandons_incomplete_tool_request(self):
         header = BEGIN_TOOL_REQUESTS + self._make_tool_header("get_weather")

@@ -492,8 +492,9 @@ class Plamo3ToolDetector(BaseFormatDetector):
         normal text or fabricating a completed call.
         """
         if self._tool_requests_finished:
+            normal_text = _strip_markers(self._buffer)
             self._buffer = ""
-            return StreamingParseResult()
+            return StreamingParseResult(normal_text=normal_text)
 
         if self._tool_requests_started:
             if self.current_tool_name_sent:
@@ -508,12 +509,9 @@ class Plamo3ToolDetector(BaseFormatDetector):
             self._reset_inflight_call_state()
             return StreamingParseResult()
 
-        held_marker_length = self._partial_marker_hold(self._buffer)
-        normal_text = (
-            self._buffer[: len(self._buffer) - held_marker_length]
-            if held_marker_length
-            else self._buffer
-        )
+        # No tool section was recognized, so the held suffix is ordinary model
+        # output. Flush it verbatim to match the non-streaming parser.
+        normal_text = self._buffer
         self._buffer = ""
         return StreamingParseResult(normal_text=normal_text)
 

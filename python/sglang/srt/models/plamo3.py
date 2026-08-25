@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import Any, Iterable, Iterator, List, Optional, Set, Tuple, Union
 
 import torch
@@ -415,21 +417,39 @@ class Plamo3ForCausalLM(nn.Module):
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
+        ".gate_up_proj.",
         ".gate_proj.",
         ".down_proj.",
         ".up_proj.",
+        ".qkv_proj.",
         ".q_proj.",
         ".k_proj.",
         ".v_proj.",
         ".o_proj.",
     ]
+    # In TP, row-parallel weights are partitioned along the input dimension.
+    column_parallel_weights_modules = [".down_proj.", ".o_proj."]
     bitsandbytes_stacked_params_mapping = {
         # shard_name, weight_name, index
+        # On-the-fly BNB loading names packed parameters ``qweight`` while the
+        # BNB linear layer exposes them as ``weight``. Keep native fused names
+        # before split suffixes: ``qkv_proj`` ends in ``v_proj``, and
+        # ``gate_up_proj`` ends in ``up_proj``.
+        "qkv_proj.qweight": ("qkv_proj.weight", 0),
+        "gate_up_proj.qweight": ("gate_up_proj.weight", 0),
+        "qkv_proj.weight": ("qkv_proj.weight", 0),
+        "gate_up_proj.weight": ("gate_up_proj.weight", 0),
+        "q_proj.qweight": ("qkv_proj.weight", 0),
+        "k_proj.qweight": ("qkv_proj.weight", 1),
+        "v_proj.qweight": ("qkv_proj.weight", 2),
+        "gate_proj.qweight": ("gate_up_proj.weight", 0),
+        "up_proj.qweight": ("gate_up_proj.weight", 1),
         "q_proj": ("qkv_proj", 0),
         "k_proj": ("qkv_proj", 1),
         "v_proj": ("qkv_proj", 2),
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
+        "qweight": ("weight", 0),
     }
 
     packed_modules_mapping = {
@@ -623,6 +643,8 @@ class Plamo3ForCausalLM(nn.Module):
                 mapped_name = ".".join(
                     param_name if part == shard_name else part for part in parts
                 )
+                if mapped_name.endswith(".qweight"):
+                    mapped_name = mapped_name.removesuffix(".qweight") + ".weight"
                 if mapped_name.endswith(".bias") and mapped_name not in params_dict:
                     continue
                 param = params_dict[mapped_name]
@@ -638,6 +660,8 @@ class Plamo3ForCausalLM(nn.Module):
                 # at runtime by get_rope.
                 if "rotary_emb" in name:
                     continue
+                if name.endswith(".qweight"):
+                    name = name.removesuffix(".qweight") + ".weight"
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 name = maybe_remap_kv_scale_name(name, params_dict)
