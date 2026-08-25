@@ -23,9 +23,9 @@ tokenizer = tiktoken.encoding_for_model("gpt-3.5-turbo")
 
 
 def format_subject(subject):
-    l = subject.split("_")
+    parts = subject.split("_")
     s = ""
-    for entry in l:
+    for entry in parts:
         s += " " + entry
     return s
 
@@ -185,13 +185,16 @@ def main(args):
         value = {
             "task": "mmlu",
             "backend": args.backend,
+            "model": args.model_path,
             "num_gpus": 1,
             "latency": round(latency, 3),
             "accuracy": round(weighted_acc, 3),
             "num_requests": len(arguments),
             "other": {
                 "nsub": args.nsub,
+                "ntrain": args.ntrain,
                 "parallel": args.parallel,
+                "revision": args.revision,
             },
         }
         fout.write(json.dumps(value) + "\n")
@@ -205,6 +208,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("--save_dir", "-s", type=str, default="results")
     parser.add_argument("--nsub", type=int, default=60)
+    parser.add_argument("--model-path", type=str)
+    parser.add_argument("--revision", type=str)
     args = add_common_sglang_args_and_parse(parser)
     download_data(args.data_dir)
     main(args)
