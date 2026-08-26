@@ -433,10 +433,19 @@ class RMSNorm(BaseFusedOp):
         override_orig_dtype: Optional = None,
         x_pad_to_multiple: int = 0,
         force_native: bool = False,
+        weight_offset: float = 0.0,
     ) -> None:
         super().__init__()
+        # Some checkpoints store the affine weight relative to a fixed model
+        # scale. The HF-style cast order is part of that model definition.
+        if weight_offset != 0.0 and not cast_x_before_out_mul:
+            raise ValueError(
+                "weight_offset requires cast_x_before_out_mul=True to preserve "
+                "the model's RMSNorm semantics"
+            )
         self.has_weight = has_weight
         self.cast_x_before_out_mul = cast_x_before_out_mul
+        self.weight_offset = weight_offset
         self.fp32_residual = fp32_residual
         self.override_orig_dtype = override_orig_dtype
         if self.has_weight:
@@ -543,7 +552,10 @@ class RMSNorm(BaseFusedOp):
                 and is_supported_rmsnorm_hf_hidden_size(x.shape[-1])
             ):
                 out = _jit_rmsnorm_hf(
-                    x.contiguous(), self.weight.data, self.variance_epsilon
+                    x.contiguous(),
+                    self.weight.data,
+                    self.variance_epsilon,
+                    weight_offset=self.weight_offset,
                 )
             else:
                 # Fallback: pure-Python HF semantics (already implemented in forward_native).
@@ -554,6 +566,7 @@ class RMSNorm(BaseFusedOp):
                 if (
                     x.dtype in (torch.float16, torch.bfloat16)
                     and self.weight.data.dtype == x.dtype
+                    and self.weight_offset == 0.0
                     and (
                         post_residual_addition is None
                         or post_residual_addition.dtype == x.dtype
@@ -599,6 +612,8 @@ class RMSNorm(BaseFusedOp):
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if self.weight_offset != 0.0:
+            return self.forward_native(x, residual, post_residual_addition)
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
@@ -621,6 +636,8 @@ class RMSNorm(BaseFusedOp):
             if residual is not None:
                 return x, residual
             return x
+        if self.weight_offset != 0.0:
+            return self.forward_native(x, residual, post_residual_addition)
         if self.weight.data.dtype != x.dtype:
             # AITER's ROCm rmsnorm2d_fwd requires weight/activation dtypes to match;
             # FP32 weight + BF16 activation yields finite-but-corrupted output on gfx950.
@@ -717,6 +734,8 @@ class RMSNorm(BaseFusedOp):
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if self.weight_offset != 0.0:
+            return self.forward_native(x, residual, post_residual_addition)
         # Fallback to native implementation if vllm is not available
         if not _has_vllm_rms_norm:
             return self.forward_native(x, residual, post_residual_addition)
@@ -757,6 +776,8 @@ class RMSNorm(BaseFusedOp):
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if self.weight_offset != 0.0:
+            return self.forward_native(x, residual, post_residual_addition)
         if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
             return self.forward_native(x, residual, post_residual_addition)
 
@@ -816,7 +837,8 @@ class RMSNorm(BaseFusedOp):
         x = x * torch.rsqrt(variance + self.variance_epsilon)
 
         if self.cast_x_before_out_mul:
-            x = self.weight * x.to(orig_dtype)
+            weight = self.weight + self.weight_offset
+            x = weight * x.to(orig_dtype)
         else:
             x = (x * self.weight).to(orig_dtype)
 
@@ -832,6 +854,8 @@ class RMSNorm(BaseFusedOp):
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if self.weight_offset != 0.0:
+            return self.forward_native(x, residual, post_residual_addition)
         if _is_cpu_amx_available:
             if residual is not None:
                 if post_residual_addition is not None:
@@ -853,6 +877,8 @@ class RMSNorm(BaseFusedOp):
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if self.weight_offset != 0.0:
+            return self.forward_native(x, residual, post_residual_addition)
         if self.variance_size_override is not None:
             return self.forward_native(x, residual, post_residual_addition)
         if is_batch_invariant_mode_enabled():

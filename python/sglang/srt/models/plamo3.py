@@ -11,6 +11,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -41,20 +42,14 @@ def get_attention_sliding_window_size(config: "Plamo3Config") -> int:
     return max(config.window_size - 1, 0)
 
 
-class Plamo3RMSNorm(nn.Module):
+class Plamo3RMSNorm(RMSNorm):
     def __init__(self, hidden_size: int, eps: float = 1e-6, offset: float = 1.0):
-        super().__init__()
-        self.weight = nn.Parameter(torch.zeros(hidden_size))
-        self.variance_epsilon = eps
-        self.offset = offset
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        in_dtype = x.dtype
-        x = x.to(torch.float32)
-        variance = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.variance_epsilon)
-        x = x.to(in_dtype)
-        return (self.offset + self.weight) * x
+        super().__init__(
+            hidden_size,
+            eps=eps,
+            cast_x_before_out_mul=True,
+            weight_offset=offset,
+        )
 
 
 class Plamo3MLP(nn.Module):
